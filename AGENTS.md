@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-AngelHeart 是一个专为 AstrBot 平台设计的智能群聊交互插件，采用创新的两级AI协作架构和4状态智能交互系统，实现高质量、低成本的智能对话交互。
+AngelHeart 是一个专为 AstrBot 平台设计的智能群聊交互插件，采用两级 AI 协作架构、离场/在场两态群聊参与模型与双防抖调度，实现高质量、低成本的智能对话交互。
 
 ## 核心设计模式
 
@@ -14,24 +14,16 @@ AngelHeart 是一个专为 AstrBot 平台设计的智能群聊交互插件，采
 - **重量级AI（专家）**：由 AstrBot 主框架提供，仅在必要时激活，生成高质量回复
 - **智能决策注入**：通过 [`inject_oneshot_decision_on_llm_request()`](main.py:88) 将分析员决策动态注入到专家的提示词中
 
-### 2. 4状态智能交互系统
+### 2. 两态参与模型与双防抖
 
-通过 [`AngelHeartStatus`](core/angel_heart_status.py:16) 枚举实现的状态机：
+群聊只以 [`AngelHeartStatus`](core/angel_heart_status.py:16) 的两种现行语义参与：
 
-- **NOT_PRESENT（不在场）**：初始状态，AI保持静默观察
-- **SUMMONED（被呼唤）**：检测到@或关键词呼唤时进入准备响应状态
-- **GETTING_FAMILIAR（混脸熟）**：检测到复读或密集讨论时主动参与
-- **OBSERVATION（观测中）**：AI回复后进入观察期，避免频繁插话
+- **NOT_PRESENT（离场）**：只缓存消息；默认（开启「仅点名入场」）只有 @ 或唤醒词命中时才能进场，关闭「仅点名入场」后任何消息都会进场处理。复读、跟风和密集聊天不触发进场；开启离场应答后，复读或密集聊天只回复一次，回复后仍离场。
+- **OBSERVATION（在场）**：由唤醒进入或回复后保持；在场超时后回到离场。
 
-状态转换由 [`StatusTransitionManager`](core/angel_heart_status.py:313) 管理，支持自动超时降级。
+`SUMMONED` 与 `GETTING_FAMILIAR` 只为旧数据/旧调用兼容保留，不是现行状态机的一部分，禁止以它们新增业务分支。
 
-### 3. 事件扣押与门锁机制
-
-实现并发控制的核心机制：
-
-- **门牌管理**：通过 [`acquire_chat_processing()`](core/angel_heart_context.py:116) 和 [`release_chat_processing()`](core/angel_heart_context.py:174) 控制会话处理权
-- **事件扣押**：通过 [`hold_and_start_observation()`](core/angel_heart_context.py:196) 实现事件排队和超时处理
-- **耐心计时器**：通过 [`start_patience_timer()`](core/angel_heart_context.py:390) 提供用户等待反馈
+群聊调度由 [`DebounceManager`](core/debounce_manager.py:46) 管理：助理防抖处理唤醒消息，秘书防抖处理在场的普通消息；旧事件 KILL，只放行最后边界事件。同一会话从秘书分析到发送或不回复收口，最多存在一轮秘书调度。
 
 ### 4. 分层架构设计
 
@@ -46,15 +38,15 @@ AngelHeart 是一个专为 AstrBot 平台设计的智能群聊交互插件，采
 
 ### 消息处理流程
 
-1. **消息接收**：[`smart_reply_handler()`](main.py:74) 接收消息事件
-2. **前置检查**：[`_should_process()`](main.py:348) 进行白名单、@消息等检查
-3. **前台缓存**：[`FrontDesk.handle_event()`](roles/front_desk.py:166) 缓存消息并触发状态检查
-4. **状态判断**：[`StatusChecker.determine_status()`](core/angel_heart_status.py:45) 决定当前状态
-5. **秘书分析**：[`Secretary.handle_message_by_state()`](roles/secretary.py:64) 根据状态处理消息
-6. **LLM分析**：[`LLMAnalyzer.analyze_and_decide()`](core/llm_analyzer.py:227) 调用轻量级AI分析
-7. **决策执行**：根据 [`SecretaryDecision`](models/analysis_result.py:4) 决定是否回复
-8. **上下文注入**：[`inject_oneshot_decision_on_llm_request()`](main.py:88) 注入决策到主框架
-9. **主脑回复**：AstrBot 主框架生成最终回复
+1. **消息接收**：[`smart_reply_handler()`](main.py:74) 接收消息事件。
+2. **前置检查**：[`_should_process()`](main.py:348) 处理白名单、上游命令等边界。
+3. **前台入账**：[`FrontDesk.handle_event()`](roles/front_desk.py:361) 将有效消息写入 `ConversationLedger`。
+4. **群聊分流**：私聊只入账并交给 AstrBot 队列；群聊由 [`_schedule_group_debounce()`](roles/front_desk.py:468) 依据当前事件是否唤醒、会话是否在场更新防抖账本。
+5. **防抖放行**：[`DebounceManager`](core/debounce_manager.py:46) KILL 被替换的旧事件，只放行最后边界事件；同会话冷却或已有秘书调度时，完整重计等待。
+6. **上下文重建**：[`_activate_group_event()`](roles/front_desk.py:549) 在放行后按账本重新读取当前上下文。
+7. **秘书分析**：[`Secretary.handle_message_by_state()`](roles/secretary.py:47) 由轻量模型决定是否回复。
+8. **主脑回复**：`should_reply=True` 才让 AstrBot 主框架继续处理该事件。
+9. **完成收口**：发送成功、不回复或异常路径释放同会话秘书调度；回复后和不回复后分别进入对应冷却。
 
 ### 上下文管理流程
 
@@ -68,9 +60,10 @@ AngelHeart 是一个专为 AstrBot 平台设计的智能群聊交互插件，采
 
 ### 新增业务逻辑
 
-1. **新增状态处理逻辑**：
-   - 在 [`Secretary.handle_message_by_state()`](roles/secretary.py:64) 中添加新的状态处理分支
-   - 在 [`StatusChecker.determine_status()`](core/angel_heart_status.py:45) 中添加状态判断逻辑
+1. **调整群聊参与规则**：
+   - 优先检查 [`FrontDesk._schedule_group_debounce()`](roles/front_desk.py:468) 与 [`DebounceManager.schedule()`](core/debounce_manager.py:160) 的完整路径。
+   - 唤醒判定改 [`StatusChecker.is_event_wake()`](core/angel_heart_status.py:206)；普通消息、冷却和同会话单飞规则改 `DebounceManager`。
+   - 不要把复读、跟风或密集发言重新接为离场进场条件；离场应答只能一次性回复，回复后保持离场。
 
 2. **新增决策因素**：
    - 修改 [`LLMAnalyzer._build_prompt()`](core/llm_analyzer.py:186) 添加新的提示词内容
@@ -90,9 +83,9 @@ AngelHeart 是一个专为 AstrBot 平台设计的智能群聊交互插件，采
    - 在 [`ConfigManager`](core/config_manager.py:7) 中添加新的配置属性
    - 更新 [`_conf_schema.json`](_conf_schema.json:1) 添加配置定义
 
-3. **修改状态定义**：
-   - 更新 [`AngelHeartStatus`](core/angel_heart_status.py:16) 枚举
-   - 同步修改 [`StatusTransitionManager`](core/angel_heart_status.py:313) 中的转换逻辑
+3. **修改参与状态定义**：
+   - 群聊当前只认 `NOT_PRESENT` 与 `OBSERVATION`；修改这两态语义属于状态机架构变更。
+   - 必须同步检查 [`AngelHeartStatus`](core/angel_heart_status.py:16)、[`StatusTransitionManager`](core/angel_heart_status.py:389)、`FrontDesk` 调度路径与架构文档。
 
 ### 配置环境
 
@@ -129,12 +122,12 @@ AngelHeart 是一个专为 AstrBot 平台设计的智能群聊交互插件，采
 ### 并发安全
 
 1. **锁使用**：所有共享状态访问必须通过相应的锁保护
-2. **原子操作**：状态转换和门锁操作必须是原子的
+2. **原子操作**：状态转换与防抖账本操作必须是原子的
 3. **异常处理**：确保在异常情况下正确释放资源
 
 ### 性能考虑
 
-1. **消息限制**：通过 `PER_CHAT_LIMIT` 和 `TOTAL_MESSAGE_LIMIT` 控制内存使用
+1. **消息限制**：通过上下文整理（token / 超时）与 `TOTAL_MESSAGE_LIMIT` 控制内存使用
 2. **缓存策略**：图片转述结果使用 dHash 缓存避免重复处理
 3. **异步优化**：所有IO操作必须异步执行
 
@@ -166,18 +159,6 @@ angel_context.proactive_manager.register_custom_trigger("my_trigger", custom_tri
 - [`behavior_rules.md`](prompts/modules/behavior_rules.md)：行为规则
 - [`decision_logic.md`](prompts/modules/decision_logic.md)：决策逻辑
 
-### 工具修饰
-
-通过配置 `tool_decorations` 为工具调用添加拟人化提示：
-
-```json
-{
-  "search": "我搜索一下|我查查|让我搜搜",
-  "memory": "嗯让我想想|稍等",
-  "python": "让我算算|计算中...|稍等我写个代码"
-}
-```
-
 ## 调试与监控
 
 ### 日志系统
@@ -198,26 +179,24 @@ print(f"当前状态: {summary['current_status']}")
 print(f"持续时间: {summary['duration_seconds']}秒")
 ```
 
-### 决策缓存
+### 决策归属
 
-通过 [`AngelHeartContext.get_decision()`](core/angel_heart_context.py:437) 获取最新决策：
-
-```python
-decision = angel_context.get_decision(chat_id)
-if decision:
-    print(f"决策: {'回复' if decision.should_reply else '不回复'}")
-    print(f"策略: {decision.reply_strategy}")
-    print(f"话题: {decision.topic}")
-```
+秘书决策：
+1. **门闩**：只决定「回不回」
+   - `should_reply=True` → 唤醒主脑
+   - `should_reply=False` → 停止事件
+2. **旁路**：挂到本事件 `event.angelheart_context`（`chat_records` + `secretary_decision`），给日志/下游钩子看
+3. **不进主脑请求体**：`req.contexts` 临时注入只留工作账本；历史重写只认 `ConversationLedger`
+4. **过时字段**：不再注入 `needs_search`
 
 ## 常见问题
 
-### Q: 如何添加新的状态？
+### Q: 如何调整群聊参与行为？
 
-A: 1. 在 [`AngelHeartStatus`](core/angel_heart_status.py:16) 枚举中添加新状态
-   2. 在 [`StatusChecker.determine_status()`](core/angel_heart_status.py:45) 中添加判断逻辑
-   3. 在 [`Secretary.handle_message_by_state()`](roles/secretary.py:64) 中添加处理方法
-   4. 在 [`StatusTransitionManager`](core/angel_heart_status.py:313) 中添加转换逻辑
+A: 1. 先确认变更是否影响离场/在场两态或双防抖规则
+   2. 调整 [`FrontDesk._schedule_group_debounce()`](roles/front_desk.py:468) 的进场与事件分流
+   3. 调整 [`DebounceManager`](core/debounce_manager.py:46) 的等待、替换、冷却与单飞门闩
+   4. 同步更新 [`docs/architecture/group_dual_debounce_state_machine.md`](docs/architecture/group_dual_debounce_state_machine.md) 和对应测试
 
 ### Q: 如何自定义消息处理逻辑？
 
@@ -255,8 +234,9 @@ A: 1. 在 [`MessageProcessor`](core/message_processor.py:21) 中添加特殊格�
 1. 完成功能修改后，先做基础检查（至少执行一次 `python -m compileall .` 或等效检查）。
 2. 查看变更：`git status --short`、`git diff`。
 3. 只提交本次相关文件：`git add <files...>`。
-4. 提交信息建议格式：`type(scope): summary`
-   - 示例：`fix(lock): ensure lock release on exception paths`
+4. 提交信息建议格式：`type(scope): 中文摘要`
+   - 示例：`fix(lock): 异常路径确保释放门锁`
    - 常用 type：`fix`、`feat`、`refactor`、`docs`、`chore`
+   - summary 使用中文；type 与 scope 保持英文小写
 5. 提交：`git commit -m "<message>"`。
 6. 若是发布提交，确认 `metadata.yaml` 已更新为目标版本后再提交。

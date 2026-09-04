@@ -2,7 +2,9 @@
 AngelHeart 插件 - 上下文处理相关工具函数
 """
 
+import copy
 import json
+import re
 from typing import List, Dict, TYPE_CHECKING, Union, Tuple
 
 if TYPE_CHECKING:
@@ -17,24 +19,27 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 
-def json_serialize_context(chat_records: List[Dict], decision: Union["SecretaryDecision", Dict], needs_search: bool = False) -> str:
+_GENERIC_IMAGE_PLACEHOLDER_RE = re.compile(r"(?:\s*\[图片\]\s*)+")
+
+
+def json_serialize_context(
+    chat_records: List[Dict],
+    decision: Union["SecretaryDecision", Dict],
+) -> str:
     """
-    将聊天记录、秘书决策和搜索标志序列化为 JSON 字符串，用于注入到 AstrMessageEvent。
+    将聊天记录与秘书决策序列化为 JSON 字符串，注入到 AstrMessageEvent。
 
     Args:
-        chat_records (List[Dict]): 聊天记录列表，每条记录为消息 Dict。
-        decision (Union[SecretaryDecision, Dict]): 秘书决策对象或字典。
-        needs_search (bool): 是否需要搜索，默认 False。
+        chat_records: 聊天记录列表
+        decision: 秘书决策对象或字典
 
     Returns:
-        str: JSON 字符串，包含 angelheart_context 数据。
+        angelheart_context JSON 字符串（chat_records + secretary_decision）
     """
-    # 输入验证
     if not isinstance(chat_records, list):
         logger.warning("chat_records 必须是列表类型，使用空列表代替")
         chat_records = []
 
-    # 确保所有聊天记录都是字典类型
     validated_records = []
     for record in chat_records:
         if isinstance(record, dict):
@@ -43,76 +48,99 @@ def json_serialize_context(chat_records: List[Dict], decision: Union["SecretaryD
             logger.warning(f"跳过非字典类型的聊天记录: {type(record)}")
 
     try:
-        # 从决策对象中获取 needs_search 信息
-        if hasattr(decision, 'needs_search'):
-            needs_search = decision.needs_search
-        elif isinstance(decision, dict) and 'needs_search' in decision:
-            needs_search = decision['needs_search']
-
-        # 使用 model_dump() 替代过时的 dict() 方法
-        if hasattr(decision, 'model_dump'):
+        if hasattr(decision, "model_dump"):
             decision_dict = decision.model_dump()
-        elif hasattr(decision, 'dict'):
+        elif hasattr(decision, "dict"):
             decision_dict = decision.dict()
         else:
             decision_dict = decision
 
+        # 过时字段：不再注入 needs_search
+        if isinstance(decision_dict, dict):
+            decision_dict = dict(decision_dict)
+            decision_dict.pop("needs_search", None)
+
         context_data = {
             "chat_records": validated_records,
             "secretary_decision": decision_dict,
-            "needs_search": needs_search
         }
         return json.dumps(context_data, ensure_ascii=False, default=str)
     except (TypeError, ValueError) as e:
         logger.error(f"序列化上下文失败: {e}")
-        # 返回一个最小化的安全上下文
         fallback_context = {
             "chat_records": [],
             "secretary_decision": {"should_reply": False, "error": "序列化失败"},
-            "needs_search": needs_search,
-            "error": "序列化失败"
+            "error": "序列化失败",
         }
         return json.dumps(fallback_context, ensure_ascii=False)
 
 
+def _slice_messages_through_id(
+    messages: List[Dict], boundary_message_id: str
+) -> List[Dict]:
+    """按消息 ID 包含式截断；找不到明确边界时拒绝扩窗。"""
+    boundary_message_id = str(boundary_message_id or "")
+    if not boundary_message_id:
+        return messages
+    for index, message in enumerate(messages):
+        if str(message.get("source_message_id", "") or "") == boundary_message_id:
+            return messages[: index + 1]
+    logger.warning(f"上下文边界消息不存在: {boundary_message_id}")
+    return []
+
+
 def partition_dialogue(
     ledger: 'ConversationLedger',
-    chat_id: str
+    chat_id: str,
+    boundary_message_id: str = "",
 ) -> Tuple[List[Dict], List[Dict], float]:
     """
-    根据指定会话的最后处理时间戳，将对话记录分割为历史和新对话。
-    这是从 ConversationLedger.get_context_snapshot 提取的核心逻辑。
-
-    同时对工具调用进行压缩处理，便于秘书分析。
-
-    Args:
-        ledger: ConversationLedger 的实例。
-        chat_id: 会话 ID。
-
-    Returns:
-        一个元组 (historical_context, recent_dialogue, boundary_timestamp)。
+    正式上下文切分（秘书轻量分析用）：
+    - 当前摘要作为历史前缀
+    - 当前连续消息块整体作为 recent（不再用 is_processed）
+    - boundary 为块尾时间戳
     """
-    # _get_or_create_ledger 是 protected, 但在这里为了重构暂时使用
-    # 使用公共方法获取消息
-    all_messages = ledger.get_all_messages(chat_id)
+    all_messages = _slice_messages_through_id(
+        ledger.get_all_messages(chat_id), boundary_message_id
+    )
+    summary = ""
+    try:
+        summary = ledger.get_current_summary(chat_id)
+    except Exception:
+        summary = ""
 
-    # 对所有消息进行工具调用压缩处理（在锁外）
-    processed_messages = []
+    # 秘书路径：压缩/丢弃工具消息
+    recent_dialogue = []
     for msg in all_messages:
         processed_msg = _compress_tool_message(msg)
-        if processed_msg:  # 只有在消息没有被丢弃时才添加
-            processed_messages.append(processed_msg)
+        if processed_msg:
+            recent_dialogue.append(processed_msg)
 
-    # 根据 is_processed 标志进行分割
-    historical_context = [m for m in processed_messages if m.get("is_processed", False)]
-    recent_dialogue = [m for m in processed_messages if not m.get("is_processed", False)]
+    recent_dialogue.sort(key=lambda m: m.get("timestamp", 0))
+    boundary_ts = recent_dialogue[-1].get("timestamp", 0.0) if recent_dialogue else 0.0
 
-    # 边界时间戳是新对话中最后一条消息的时间戳
-    boundary_ts = 0.0
-    if recent_dialogue:
-        # 为确保准确，最好在取最后一个元素前按时间戳排序
-        recent_dialogue.sort(key=lambda m: m.get("timestamp", 0))
-        boundary_ts = recent_dialogue[-1].get("timestamp", 0.0)
+    historical_context = []
+    if summary:
+        has_summary_msg = any(
+            m.get("kind") in ("context_summary", "summary_context", "context_compaction")
+            for m in recent_dialogue[:1]
+        )
+        if not has_summary_msg:
+            ts = recent_dialogue[0].get("timestamp", 0) if recent_dialogue else 0
+            historical_context = [
+                {
+                    "role": "system",
+                    "content": f"[当前摘要]\n{summary}",
+                    "sender_id": "system",
+                    "sender_name": "context_summary",
+                    "kind": "context_summary",
+                    "timestamp": max(0.0, float(ts) - 0.001) if ts else 0.0,
+                }
+            ]
+        else:
+            # 块内已有摘要消息：把它视作历史前缀，其余当 recent
+            historical_context = [recent_dialogue[0]]
+            recent_dialogue = recent_dialogue[1:]
 
     return historical_context, recent_dialogue, boundary_ts
 
@@ -165,34 +193,49 @@ def _generate_tool_description(tool_name: str, tool_args: Dict) -> str:
 
 def partition_dialogue_raw(
     ledger: 'ConversationLedger',
-    chat_id: str
+    chat_id: str,
+    boundary_message_id: str = "",
 ) -> Tuple[List[Dict], List[Dict], float]:
     """
-    根据指定会话的最后处理时间戳，将对话记录分割为历史和新对话。
-    与 partition_dialogue 的区别是：此函数保留原始的工具调用结构，不进行压缩。
-    专门用于给老板（前台LLM）构建完整的上下文。
-
-    Args:
-        ledger: ConversationLedger 的实例。
-        chat_id: 会话 ID。
-
-    Returns:
-        一个元组 (historical_context, recent_dialogue, boundary_timestamp)。
+    正式上下文切分（主脑完整上下文）：
+    - 当前摘要作为历史前缀
+    - 当前连续消息块作为 recent
+    - 保留工具结构
+    - 不再使用 is_processed
     """
-    # 使用公共方法获取消息
-    all_messages = ledger.get_all_messages(chat_id)
+    all_messages = _slice_messages_through_id(
+        ledger.get_all_messages(chat_id), boundary_message_id
+    )
+    summary = ""
+    try:
+        summary = ledger.get_current_summary(chat_id)
+    except Exception:
+        summary = ""
 
-    # 不进行任何压缩处理，保留原始消息结构
-    # 直接根据 is_processed 标志进行分割
-    historical_context = [m for m in all_messages if m.get("is_processed", False)]
-    recent_dialogue = [m for m in all_messages if not m.get("is_processed", False)]
+    recent_dialogue = sorted(all_messages, key=lambda m: m.get("timestamp", 0))
+    boundary_ts = recent_dialogue[-1].get("timestamp", 0.0) if recent_dialogue else 0.0
 
-    # 边界时间戳是新对话中最后一条消息的时间戳
-    boundary_ts = 0.0
-    if recent_dialogue:
-        # 为确保准确，最好在取最后一个元素前按时间戳排序
-        recent_dialogue.sort(key=lambda m: m.get("timestamp", 0))
-        boundary_ts = recent_dialogue[-1].get("timestamp", 0.0)
+    historical_context = []
+    if summary:
+        has_summary_msg = any(
+            m.get("kind") in ("context_summary", "summary_context", "context_compaction")
+            for m in recent_dialogue[:1]
+        )
+        if not has_summary_msg:
+            ts = recent_dialogue[0].get("timestamp", 0) if recent_dialogue else 0
+            historical_context = [
+                {
+                    "role": "system",
+                    "content": f"[当前摘要]\n{summary}",
+                    "sender_id": "system",
+                    "sender_name": "context_summary",
+                    "kind": "context_summary",
+                    "timestamp": max(0.0, float(ts) - 0.001) if ts else 0.0,
+                }
+            ]
+        else:
+            historical_context = [recent_dialogue[0]]
+            recent_dialogue = recent_dialogue[1:]
 
     return historical_context, recent_dialogue, boundary_ts
 
@@ -221,16 +264,109 @@ def format_decision_xml(decision: 'SecretaryDecision') -> str:
     return decision_xml
 
 
-def format_final_prompt(recent_dialogue: List[Dict], decision: 'SecretaryDecision', alias: str = "AngelHeart") -> str:
+def format_final_prompt(
+    recent_dialogue: List[Dict],
+    decision: 'SecretaryDecision',
+    alias: str = "AngelHeart",
+    use_absolute_time: bool = True,
+) -> str:
     """
     为大模型生成最终的用户对话文本（不包含系统决策和 XML 包裹）。
     """
     from .xml_formatter import format_message_to_text
 
+    marked_dialogue = _with_current_round_image_markers(recent_dialogue)
+
     # 将需要回应的新对话格式化为文本字符串
-    dialogue_str = "\n".join([
-        format_message_to_text(msg, alias)
-        for msg in recent_dialogue
-    ])
+    dialogue_str = "\n".join(
+        [
+            format_message_to_text(
+                msg, alias, use_relative_time=not use_absolute_time
+            )
+            for msg in marked_dialogue
+        ]
+    )
 
     return dialogue_str
+
+
+def _with_current_round_image_markers(messages: List[Dict]) -> List[Dict]:
+    """为当前轮 prompt 注入跨消息递增的图片锚点。"""
+    marked_messages = []
+    image_index = 1
+
+    for msg in messages:
+        image_count = _count_prompt_images(msg)
+        if image_count <= 0:
+            marked_messages.append(msg)
+            continue
+
+        markers = [f"[图片{i}]" for i in range(image_index, image_index + image_count)]
+        image_index += image_count
+        marked_messages.append(_append_image_markers(msg, markers))
+
+    return marked_messages
+
+
+def _count_prompt_images(msg: Dict) -> int:
+    """统计当前 prompt 中需要编号的图片数量。"""
+    content = msg.get("content")
+    if isinstance(content, list):
+        count = sum(
+            1
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "image_url"
+        )
+        if count:
+            return count
+
+    image_refs = msg.get("image_refs")
+    if isinstance(image_refs, list):
+        return sum(1 for ref in image_refs if isinstance(ref, str) and ref.strip())
+
+    return 0
+
+
+def _append_image_markers(msg: Dict, markers: List[str]) -> Dict:
+    """返回一条带图片编号文本锚点的消息副本。"""
+    marked_msg = copy.deepcopy(msg)
+    marker_text = " ".join(markers)
+    content = marked_msg.get("content")
+
+    if isinstance(content, list):
+        text_items = [
+            item
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        for item in text_items:
+            item["text"] = _strip_generic_image_placeholders(item.get("text", ""))
+
+        non_empty_text_items = [
+            item for item in text_items if str(item.get("text", "")).strip()
+        ]
+        if non_empty_text_items:
+            last_text_item = non_empty_text_items[-1]
+            text = str(last_text_item.get("text", "")).rstrip()
+            last_text_item["text"] = f"{text} {marker_text}".strip()
+        else:
+            insert_at = 0
+            for idx, item in enumerate(content):
+                if isinstance(item, dict) and item.get("type") == "image_url":
+                    insert_at = idx
+                    break
+            else:
+                insert_at = len(content)
+            content.insert(insert_at, {"type": "text", "text": marker_text})
+        return marked_msg
+
+    text = _strip_generic_image_placeholders(str(content or ""))
+    marked_msg["content"] = f"{text} {marker_text}".strip() if text else marker_text
+    return marked_msg
+
+
+def _strip_generic_image_placeholders(text: str) -> str:
+    """移除平台 outline 中不带编号的 [图片] 占位。"""
+    if not text:
+        return ""
+    return _GENERIC_IMAGE_PLACEHOLDER_RE.sub(" ", str(text)).strip()

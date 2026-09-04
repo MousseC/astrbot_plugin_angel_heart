@@ -81,4 +81,29 @@ def strip_markdown(text: str) -> str:
     # 使用全局的 MarkdownIt 实例以提高性能
     global _md_strip_instance
     # 渲染并返回纯文本
-    return _md_strip_instance.render(text)
+    cleaned_text = _md_strip_instance.render(text)
+
+    # 如果是单行且末尾是句号/句点，去掉最后一个标点
+    if not cleaned_text:
+        return cleaned_text
+
+    if "\n" not in cleaned_text and "\r" not in cleaned_text:
+        stripped = cleaned_text.rstrip()
+        if stripped.endswith(".") or stripped.endswith("。"):
+            cleaned_text = stripped[:-1] + cleaned_text[len(stripped) :]
+
+    return cleaned_text
+
+
+def strip_period_before_newline(text: str) -> str:
+    """
+    清理换行符之前的中文句号。
+
+    特征：换行符（\\n / \\r\\n）之前的中文句号「。」，清理掉该句号，保留换行。
+    例如：
+        "你好。\n明天见。" -> "你好\n明天见"
+        "第一行。\r\n第二行。" -> "第一行\r\n第二行"
+    """
+    if not text:
+        return text
+    return re.sub(r"。(\r?\n)", r"\1", text)

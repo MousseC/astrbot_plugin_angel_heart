@@ -3,12 +3,67 @@ AngelHeart 插件 - 消息格式化工具
 负责将各种角色的消息转换为文本格式，并支持可选的 XML 包裹。
 """
 
-from .time_utils import format_relative_time
+from .time_utils import format_relative_time, format_absolute_time
 from .content_utils import convert_content_to_string
 
 
+def build_image_attachment_text(msg: dict) -> str:
+    """按统一格式构建图片附件文本块。"""
+    image_caption = msg.get("image_caption", "")
+    if not isinstance(image_caption, str) or not image_caption.strip():
+        return ""
+
+    refs = []
+    stored_refs = msg.get("image_refs", [])
+    if isinstance(stored_refs, list):
+        refs.extend(
+            ref for ref in stored_refs if isinstance(ref, str) and ref.strip()
+        )
+
+    content = msg.get("content", [])
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "image_url":
+                continue
+            ref = (
+                item.get("cache_path")
+                or item.get("local_file_path")
+                or item.get("original_file_url")
+                or item.get("original_url")
+            )
+            if not ref:
+                image_url = item.get("image_url", {})
+                if isinstance(image_url, dict):
+                    url = image_url.get("url", "")
+                    if isinstance(url, str) and url and not url.startswith("data:"):
+                        ref = url
+            if isinstance(ref, str) and ref.strip():
+                refs.append(ref)
+
+    deduped_refs = []
+    seen = set()
+    for ref in refs:
+        if ref not in seen:
+            deduped_refs.append(ref)
+            seen.add(ref)
+
+    path_text = "\n".join(deduped_refs) if deduped_refs else "未知"
+    caption_text = image_caption.strip()
+    return (
+        "<图片附件>\n"
+        "#图片路径#：\n"
+        f"{path_text}\n"
+        "#图片描述#：\n"
+        f"{caption_text}\n"
+        "</图片附件>"
+    )
+
+
 def format_message_to_text(
-    msg: dict, alias: str = "AngelHeart", wrapper_tag: str = None
+    msg: dict,
+    alias: str = "AngelHeart",
+    wrapper_tag: str = None,
+    use_relative_time: bool = False,
 ) -> str:
     """
     将消息转换为文本格式，并可选地使用 XML 标签包裹。
@@ -17,6 +72,7 @@ def format_message_to_text(
         msg (dict): 消息字典。
         alias (str): AI 的昵称。
         wrapper_tag (str): 可选的 XML 包裹标签（如 "已回应消息"）。
+        use_relative_time (bool): 是否使用相对时间，False 则使用当地绝对时间。
 
     Returns:
         str: 格式化后的字符串。
@@ -24,6 +80,13 @@ def format_message_to_text(
     role = msg.get("role")
     content = msg.get("content", "")
     text_content = convert_content_to_string(content)
+    image_attachment_text = build_image_attachment_text(msg)
+    if image_attachment_text:
+        text_content = (
+            f"{text_content}\n\n{image_attachment_text}"
+            if text_content
+            else image_attachment_text
+        )
 
     formatted_body = ""
 
@@ -41,19 +104,24 @@ def format_message_to_text(
             sender_id = msg.get("sender_id", "Unknown")
             sender_name = msg.get("sender_name", "成员")
             timestamp = msg.get("timestamp")
-            relative_time = format_relative_time(timestamp)
+            if use_relative_time:
+                time_tag = format_relative_time(timestamp)
+            else:
+                time_tag = format_absolute_time(timestamp)
 
-            # 恢复旧格式：
-            # [群友: 昵称 (ID: ...)] (相对时间)
-            # [内容: 类型]
-            # 实际内容
-
-
-            header = f"[群友: {sender_name} (ID: {sender_id})]{relative_time}"
+            chat_id = str(msg.get("chat_id", "") or "")
+            if ":GroupMessage:" in chat_id:
+                header = f"[群友: {sender_name} (ID: {sender_id})]{time_tag}"
+            else:
+                header = f"[{sender_name} (ID: {sender_id})]{time_tag}"
             formatted_body = f"{header}: {text_content}"
         else:
             # 历史记录回退
-            formatted_body = f"[群友(历史记录)]\n[内容: 文本]\n{text_content}"
+            chat_id = str(msg.get("chat_id", "") or "")
+            if ":GroupMessage:" in chat_id:
+                formatted_body = f"[群友(历史记录)]\n[内容: 文本]\n{text_content}"
+            else:
+                formatted_body = f"[历史记录]\n[内容: 文本]\n{text_content}"
 
     # 2. Assistant (助理) 消息处理
     elif role == "assistant":

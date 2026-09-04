@@ -104,3 +104,31 @@ def get_beijing_time_str() -> str:
     weekday_str = weekdays[now.weekday()]
 
     return f"{time_str} ({weekday_str})"
+
+
+def format_absolute_time(timestamp: float) -> str:
+    """
+    将 Unix 时间戳格式化为绝对时间字符串（精确到分钟）。
+
+    Args:
+        timestamp (float): Unix 时间戳。
+
+    Returns:
+        str: 形如 " (YYYY-MM-DD HH:MM)"，按系统当地时区格式化；时间无效时返回空字符串。
+    """
+    if not timestamp:
+        return ""
+
+    try:
+        timestamp = float(timestamp)
+    except (ValueError, TypeError):
+        return ""
+
+    if timestamp <= 0:
+        return ""
+
+    try:
+        msg_dt = datetime.fromtimestamp(timestamp).astimezone()
+        return f" ({msg_dt.strftime('%Y-%m-%d %H:%M')})"
+    except (OverflowError, OSError, ValueError):
+        return ""

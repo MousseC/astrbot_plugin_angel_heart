@@ -13,10 +13,10 @@ MessageProcessor - 前台消息处理器
 """
 
 import copy
-from datetime import datetime, timezone, timedelta
 from typing import Any, List, Dict
 
 from .utils import format_message_to_text
+from .utils.message_utils import serialize_content_parts
 
 
 class MessageProcessor:
@@ -82,6 +82,18 @@ class MessageProcessor:
 
     def _handle_regular_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
         """处理普通消息（使用已有的图片转述、文本格式化等）"""
+        role = msg.get("role", "user")
+
+        # assistant 常规消息必须保留原始结构，避免丢失 think / 多模态 parts。
+        if role == "assistant":
+            original_content = msg.get("content", [])
+            if isinstance(original_content, str):
+                return {"role": role, "content": original_content}
+            return {
+                "role": role,
+                "content": self._normalize_content(original_content),
+            }
+
         # 预处理消息内容：使用已有的图片转述和多模态内容
         processed_msg = copy.deepcopy(msg)
         original_content = processed_msg.get("content", [])
@@ -92,7 +104,7 @@ class MessageProcessor:
         # 使用 ConversationLedger 中已生成的图片转述
         image_caption = processed_msg.get("image_caption")
         if image_caption:
-            content_list = self._apply_image_caption(content_list, image_caption)
+            content_list = self._remove_image_components(content_list)
 
         # 更新消息内容为处理后的列表
         processed_msg["content"] = content_list
@@ -103,27 +115,16 @@ class MessageProcessor:
         # 提取原始的图片组件
         image_components = self._extract_image_components(original_content)
         image_ref_text = self._build_image_refs_text(image_components)
-        time_anchor_blocks = self._build_time_anchor_blocks(msg)
 
         # 构建最终内容
-        role = msg.get("role", "user")
-        # 强制规则：
-        # 1. 助理消息：无条件字符串
-        # 2. 用户消息：无图片 -> 字符串，有图片 -> 多模态列表
-        if role == "assistant":
-            final_content = xml_content  # 助理消息保持纯文本字符串
-            if image_ref_text:
-                final_content = f"{final_content}\n{image_ref_text}"
-        elif not image_components:
-            # 用户纯文本消息也使用文本块列表，方便追加时间锚点块
+        # 用户消息：无图片 -> 字符串，有图片 -> 多模态列表
+        if not image_components:
             final_content = [{"type": "text", "text": xml_content}]
-            final_content.extend(time_anchor_blocks)
             if image_ref_text:
                 final_content.append({"type": "text", "text": image_ref_text})
         else:
             # 只有用户消息且包含图片时，返回多模态列表
             final_content = [{"type": "text", "text": xml_content}]
-            final_content.extend(time_anchor_blocks)
             if image_ref_text:
                 final_content.append({"type": "text", "text": image_ref_text})
             final_content.extend(image_components)
@@ -138,20 +139,14 @@ class MessageProcessor:
         if isinstance(content, str):
             return [{"type": "text", "text": content}]
         elif isinstance(content, list):
-            return content.copy()
+            normalized = serialize_content_parts(content)
+            return normalized if isinstance(normalized, list) else []
         else:
             return [{"type": "text", "text": str(content)}]
 
-    def _apply_image_caption(self, content_list: List[Dict[str, Any]], image_caption: str) -> List[Dict[str, Any]]:
-        """使用 ConversationLedger 中已生成的 image_caption，移除图片组件，添加转述文本"""
-        caption_text = f"<图片转述>{image_caption}</图片转述>"
-        # 移除所有图片组件
-        filtered_list = [
-            item for item in content_list if item.get("type") != "image_url"
-        ]
-        # 添加转述文本
-        filtered_list.append({"type": "text", "text": caption_text})
-        return filtered_list
+    def _remove_image_components(self, content_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """移除图片组件，仅保留原有文本内容。"""
+        return [item for item in content_list if item.get("type") != "image_url"]
 
     def _extract_image_components(self, original_content: Any) -> List[Dict[str, Any]]:
         """从原始内容中提取图片组件"""
@@ -173,7 +168,8 @@ class MessageProcessor:
             if not isinstance(item, dict):
                 continue
             ref = (
-                item.get("local_file_path")
+                item.get("cache_path")
+                or item.get("local_file_path")
                 or item.get("original_file_url")
                 or item.get("original_url")
             )
@@ -193,21 +189,3 @@ class MessageProcessor:
 
         lines = [f"[Image Ref {idx}] {ref}" for idx, ref in enumerate(refs, start=1)]
         return "\n".join(lines)
-
-    def _build_time_anchor_blocks(self, msg: Dict[str, Any]) -> List[Dict[str, str]]:
-        """
-        构建额外时间锚点文本块，使用消息发送时间（而非当前时间）。
-        格式示例：2026-03-20 17:28 (CST)
-        """
-        cst = timezone(timedelta(hours=8))
-        timestamp = msg.get("timestamp")
-        try:
-            if timestamp is not None:
-                ts = float(timestamp)
-                if ts > 0:
-                    msg_dt = datetime.fromtimestamp(ts, cst).strftime("%Y-%m-%d %H:%M")
-                    return [{"type": "text", "text": f"{msg_dt} (CST)"}]
-        except (TypeError, ValueError, OSError):
-            pass
-
-        return []

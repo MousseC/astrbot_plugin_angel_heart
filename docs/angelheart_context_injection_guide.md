@@ -4,11 +4,11 @@
 
 AngelHeart 插件实现了一种智能的上下文注入机制，通过在 AstrBot 事件流中注入结构化的对话上下文，帮助其他插件更好地理解和响应用户交互。
 
-AngelHeart 通过分析对话历史、决策是否回复以及搜索需求等信息，将这些上下文数据以 JSON 字符串的形式注入到 `AstrMessageEvent` 对象的 `angelheart_context` 属性中，供下游插件使用。
+AngelHeart 通过分析对话历史和秘书是否回复的决策，将这些上下文数据以 JSON 字符串的形式注入到 `AstrMessageEvent` 对象的 `angelheart_context` 属性中，供下游插件使用。
 
 ## 上下文数据结构
 
-注入的上下文以 JSON 字符串形式存储在 `event.angelheart_context` 中，包含以下三个核心字段：
+注入的上下文以 JSON 字符串形式存储在 `event.angelheart_context` 中，包含以下两个核心字段：
 
 ### 1. chat_records（聊天记录）
 
@@ -20,8 +20,7 @@ AngelHeart 通过分析对话历史、决策是否回复以及搜索需求等信
   "content": "消息内容",
   "sender_id": "发送者ID",
   "sender_name": "发送者昵称",
-  "timestamp": 1640995200.0,
-  "is_processed": true
+  "timestamp": 1640995200.0
 }
 ```
 
@@ -31,21 +30,19 @@ AngelHeart 通过分析对话历史、决策是否回复以及搜索需求等信
 
 ```json
 {
-  "should_reply": true,              // 是否需要介入
-  "is_questioned": false,             // 是否被追问（用户在继续之前的话题或要求回应之前的回答）
-  "is_interesting": false,            // 话题是否有趣（符合AI身份、能提供价值、介入合适）
-  "reply_strategy": "技术指导",       // 概述你计划采用的策略。如果 should_reply 为 false，此项应为 '继续观察'
-  "topic": "Python调试问题",          // 对当前唯一核心话题的简要概括
-  "reply_target": "小明",            // 回复目标用户的昵称或ID。如果不需要回复，此项应为空字符串
-  "entities": ["小明", "Python调试"], // 实体列表，优先级最高的发言人ID，其次是其他对话中的实体（包含但不限于人物、话题、物品、时间、地点、活动等）
-  "facts": ["小明询问Python调试"],    // 极简日志模式。只保留'谁 做了 什么'或'谁 提议 什么'。单句禁止超过15个字，禁止形容词
-  "keywords": ["Python", "调试"]      // 1-3个核心搜索词
+  "should_reply": true,
+  "is_questioned": false,
+  "is_interesting": false,
+  "reply_strategy": "技术指导",
+  "topic": "Python调试问题",
+  "reply_target": "小明",
+  "entities": ["小明", "Python调试"],
+  "facts": ["小明询问Python调试"],
+  "keywords": ["Python", "调试"]
 }
 ```
 
-### 3. needs_search（全局搜索标志）
-
-一个布尔值，表示当前对话是否需要进行网络搜索来获取额外信息。
+AngelHeart 上下文注入的 JSON 只包含聊天记录和秘书决策；下游应以实际返回结构为准，不要假设存在未声明的额外字段。
 
 ## 完整上下文示例
 
@@ -59,8 +56,7 @@ AngelHeart 通过分析对话历史、决策是否回复以及搜索需求等信
       ],
       "sender_id": "123456",
       "sender_name": "小明",
-      "timestamp": 1640995200.123,
-      "is_processed": true
+      "timestamp": 1640995200.123
     },
     {
       "role": "assistant",
@@ -69,8 +65,7 @@ AngelHeart 通过分析对话历史、决策是否回复以及搜索需求等信
       ],
       "sender_id": "bot123",
       "sender_name": "小助手",
-      "timestamp": 1640995260.456,
-      "is_processed": true
+      "timestamp": 1640995260.456
     }
   ],
   "secretary_decision": {
@@ -83,8 +78,7 @@ AngelHeart 通过分析对话历史、决策是否回复以及搜索需求等信
     "entities": ["小明", "Python调试"],
     "facts": ["小明询问调试方法"],
     "keywords": ["Python", "调试"]
-  },
-  "needs_search": false
+  }
 }
 ```
 
@@ -116,8 +110,7 @@ class MyPlugin(Star):
             # 提取各个字段
             chat_records = context.get('chat_records', [])
             secretary_decision = context.get('secretary_decision', {})
-            needs_search = context.get('needs_search', False)
-
+            
             # 处理多模态内容
             for record in chat_records:
                 content = record.get('content', [])
@@ -182,20 +175,20 @@ async def conditional_prompt_enhancement(self, event: AstrMessageEvent, request:
         return
 
     decision = context.get('secretary_decision', {})
-    persona_name = decision.get('persona_name', '')
+    reply_strategy = decision.get('reply_strategy', '')
 
-    if persona_name:
-        # 添加人格信息到系统提示
-        personality_prompt = f"你现在扮演 {persona_name} 的角色。"
+    if reply_strategy:
+        # 根据实际存在的秘书决策字段添加提示
+        strategy_prompt = f"本轮建议回复策略：{reply_strategy}。"
         if request.system_prompt:
-            request.system_prompt += f"\n{personality_prompt}"
+            request.system_prompt += f"\n{strategy_prompt}"
         else:
-            request.system_prompt = personality_prompt
+            request.system_prompt = strategy_prompt
 ```
 
-### 示例2：搜索需求处理
+### 示例2：基于关键词添加搜索提示
 
-在需要搜索时添加搜索工具调用：
+在检测到关键词线索时添加搜索提示：
 
 ```python
 @on_llm_request()
@@ -206,18 +199,17 @@ async def handle_search_requirement(self, event: AstrMessageEvent, request: Prov
     if not context:
         return
 
-    needs_search = context.get('needs_search', False)
     decision = context.get('secretary_decision', {})
 
-    if needs_search or decision.get('needs_search', False):
-        # 添加搜索相关的系统指令
+    if decision.get('keywords'):
+        # 关键词只表示秘书提取的主题线索，不代表系统一定需要搜索
         search_instruction = "如果需要查找信息，请使用可用的搜索工具。"
         if request.system_prompt:
             request.system_prompt += f"\n{search_instruction}"
         else:
             request.system_prompt = search_instruction
 
-        logger.info("检测到搜索需求，已添加搜索指令")
+        logger.info("检测到关键词线索，已添加搜索提示")
 ```
 
 ### 示例3：上下文感知的回复过滤
@@ -268,7 +260,7 @@ async def collect_statistics(self, event: AstrMessageEvent):
         self.reply_stats[strategy] = self.reply_stats.get(strategy, 0) + 1
 
         # 记录搜索使用情况
-        if decision.get('needs_search', False):
+        if decision.get('keywords'):
             self.search_count += 1
 
         logger.debug(f"AngelHeart 回复统计已更新: {strategy}")
